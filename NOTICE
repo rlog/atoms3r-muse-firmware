@@ -1,0 +1,15 @@
+ATOMS3R Muse Firmware
+
+Derived from facebookincubator/muse-gadget-sdk:
+https://github.com/facebookincubator/muse-gadget-sdk
+Upstream source revision: b139b45064b4dcecf7bfe97e75bc7f99c10c28b6
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This distribution changes the upstream ESP32 firmware to add the ATOMS3R +
+Atomic Echo Base board, MiniMax streaming speech and persistent voice selection,
+Shadowsocks 2022 TCP routing, PNG/JPEG reply display and private base64 image
+delivery, bounded control-message reassembly, and private build configuration.
+These additions are licensed under Apache-2.0 except vendored dependencies
+with their own retained licenses. This is an independent community adaptation.
+Muse and M5Stack names identify compatible services and hardware.

@@ -1,0 +1,2 @@
+cryptography>=42
+blake3>=1

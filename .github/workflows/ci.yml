@@ -1,0 +1,28 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-22.04
+    container: espressif/idf:v6.0.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build all ATOMS3R features with public fixtures
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          python tools/build.py --config config/ci.json
+      - name: Install host test dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential pkg-config libmbedtls-dev libpng-dev libcjson-dev python3-venv
+          /usr/bin/python3 -m venv /tmp/atoms3r-host-tests
+          /tmp/atoms3r-host-tests/bin/python -m pip install -r requirements-dev.txt
+      - name: Run configuration, firmware and credential checks
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          /tmp/atoms3r-host-tests/bin/python -m unittest discover -s tests
+          /tmp/atoms3r-host-tests/bin/python -m unittest discover -s esp32/tests
+          /tmp/atoms3r-host-tests/bin/python tools/check_secrets.py

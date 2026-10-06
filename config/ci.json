@@ -1,0 +1,19 @@
+{
+  "muse": {
+    "sdk_token": ""
+  },
+  "minimax": {
+    "enabled": true,
+    "api_key": "ci-public-placeholder-not-a-real-key",
+    "url": "https://api.minimax.cn/v1/t2a_v2",
+    "model": "speech-2.8-turbo",
+    "voice": "Chinese (Mandarin)_Cute_Spirit"
+  },
+  "proxy": {
+    "enabled": true,
+    "method": "2022-blake3-aes-128-gcm",
+    "server": "192.0.2.1",
+    "port": 24443,
+    "key": "AAECAwQFBgcICQoLDA0ODw=="
+  }
+}

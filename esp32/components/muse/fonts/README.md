@@ -1,3 +1,4 @@
+<!-- Modified in the ATOMS3R Muse Firmware community distribution (2026-10-06). See root NOTICE. -->
 # Fonts
 
 `muse_font_cjk_16.c` is the CJK fallback for the caption font, built in only

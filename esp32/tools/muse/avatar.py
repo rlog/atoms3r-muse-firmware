@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified in the ATOMS3R Muse Firmware community distribution (2026-10-06). See root NOTICE.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,4 @@
+/* Modified in the ATOMS3R Muse Firmware community distribution (2026-10-06). See root NOTICE. */
 #include "muse_proxy.h"
 #include "muse_tts_config.h"
 /*

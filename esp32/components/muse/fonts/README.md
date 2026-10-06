@@ -11,3 +11,8 @@ GNU Unifont is by Roman Czyborra, Paul Hardy and contributors
 SIL Open Font License, version 1.1 (https://openfontlicense.org), and under
 the GNU GPL version 2 or later with the GNU font embedding exception. This
 file is a conversion of an unaltered subset of the font.
+
+This community distribution uses the fonts under OFL-1.1. The exact Unifont
+16.0.04 distribution's licensing text is retained in LICENSE.Unifont and
+OFL-1.1.txt; UNIFONT-COPYRIGHT.txt preserves the original OpenType copyright
+record. The font glyphs are not relicensed under the firmware's Apache-2.0 license.

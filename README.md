@@ -33,7 +33,7 @@ but this project's build helper and hardware validation target the ATOMS3R.
   <img src="assets/atoms3r-voice-retouched.png" alt="ATOMS3R screen while sending a voice message" width="240" height="240">
 </p>
 
-<p align="center"><em>Hardware stack and voice-message screen. Photos retouched to remove hands and improve the background.</em></p>
+<p align="center"><em>Hardware stack and voice-message screen.</em></p>
 
 ## Quick start
 

@@ -28,7 +28,7 @@
   <img src="assets/atoms3r-voice-retouched.png" alt="ATOMS3R 发送语音消息时的屏幕" width="240" height="240">
 </p>
 
-<p align="center"><em>设备叠层与语音发送界面。照片经去手与背景优化处理。</em></p>
+<p align="center"><em>设备叠层与语音发送界面。</em></p>
 
 ## 快速开始
 

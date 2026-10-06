@@ -26,6 +26,15 @@ but this project's build helper and hardware validation target the ATOMS3R.
 - Square 128×128 images for requests sent from the ATOM. Muse exports a local image file and sends its bytes as base64 over the existing encrypted control session, avoiding a public upload. If the generator cannot output 128×128 directly, Muse resizes the image locally before sending it.
 - PNG and baseline JPEG decoding, PSRAM buffers, and fragmented control-message reassembly.
 
+## Device photos
+
+<p align="center">
+  <img src="assets/atoms3r-stack-retouched.png" alt="ATOMS3R with Atomic Echo Base and Atomic Battery Base" width="240" height="240">
+  <img src="assets/atoms3r-voice-retouched.png" alt="ATOMS3R screen while sending a voice message" width="240" height="240">
+</p>
+
+<p align="center"><em>Hardware stack and voice-message screen. Photos retouched to remove hands and improve the background.</em></p>
+
 ## Quick start
 
 Install Python 3, Git, and **ESP-IDF v6.0.1**, then activate the ESP-IDF environment.

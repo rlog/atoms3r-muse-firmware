@@ -21,6 +21,15 @@
 - ATOM 生图请求输出 128×128 方图；由 Muse 在本地导出文件，通过 base64 和现有加密控制会话直传，省去公网上传。生成器不支持该尺寸时，本地缩放后发送。
 - PNG / baseline JPEG 解码，PSRAM 缓冲，大控制消息分片重组。
 
+## 实机展示
+
+<p align="center">
+  <img src="assets/atoms3r-stack-retouched.png" alt="ATOMS3R 搭配 Atomic Echo Base 和 Atomic Battery Base" width="240" height="240">
+  <img src="assets/atoms3r-voice-retouched.png" alt="ATOMS3R 发送语音消息时的屏幕" width="240" height="240">
+</p>
+
+<p align="center"><em>设备叠层与语音发送界面。照片经去手与背景优化处理。</em></p>
+
 ## 快速开始
 
 需要 Python 3、Git 和 **ESP-IDF v6.0.1**，先按 Espressif 的安装说明安装并激活工具链。

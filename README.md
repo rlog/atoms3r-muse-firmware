@@ -1,85 +1,100 @@
 # ATOMS3R Muse Firmware
 
-Community firmware for **M5Stack ATOMS3R + Atomic Echo Base**: Muse chat,
-MiniMax streaming speech, configurable voice, optional Shadowsocks 2022 TCP
-proxy, and private 128×128 image delivery. Apache-2.0.
+**English** | [简体中文](readme.CN.md)
 
-基于 [Meta Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk)
-的社区适配，保留上游版权及许可证。硬件实测目标为 ATOMS3R 的 8MB Flash / 8MB PSRAM
-版本与 Atomic Echo Base；其他上游板型的代码仍保留，但本项目构建入口和实机验证针对 ATOMS3R。
+Community firmware for **M5Stack ATOMS3R + Atomic Echo Base**, with Muse chat,
+MiniMax streaming speech, persistent voice selection, an optional Shadowsocks
+2022 TCP proxy, and private 128×128 image delivery. Licensed under Apache-2.0,
+with separate licenses retained for third-party components and fonts.
 
-## 功能
+This adaptation is based on the
+[Meta Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk).
+Hardware testing covers the ATOMS3R with 8 MB flash and 8 MB PSRAM, paired with
+the Atomic Echo Base. Other upstream board implementations remain in the source,
+but this project's build helper and hardware validation target the ATOMS3R.
 
-- Muse App 配对、Wi-Fi 联网、按键语音与屏幕字幕。
-- MiniMax SSE 流式朗读，分句播放，处理空行和多段落。
-- 音色可通过 USB 设置并保存，不需要重新编译。
-- 可选 Shadowsocks 2022 AES-128-GCM TCP 代理，保留 TLS 域名和证书验证。
-- ATOM 生图请求输出 128×128 方图；由 Muse 在本地导出文件，通过 base64 和现有加密控制会话直传，省去公网上传。生成器不支持该尺寸时，本地缩放后发送。
-- PNG / baseline JPEG 解码，PSRAM 缓冲，大控制消息分片重组。
+## Features
 
-## 快速开始
+- Muse App pairing, Wi-Fi connectivity, push-to-talk input, and on-screen captions.
+- MiniMax SSE streaming speech, with sentence-by-sentence playback and support for blank lines and multiple paragraphs.
+- Persistent voice selection over USB, without recompiling the firmware.
+- Optional Shadowsocks 2022 AES-128-GCM TCP routing, preserving TLS certificate and hostname verification.
+- Square 128×128 images for requests sent from the ATOM. Muse exports a local image file and sends its bytes as base64 over the existing encrypted control session, avoiding a public upload. If the generator cannot output 128×128 directly, Muse resizes the image locally before sending it.
+- PNG and baseline JPEG decoding, PSRAM buffers, and fragmented control-message reassembly.
 
-需要 Python 3、Git 和 **ESP-IDF v6.0.1**，先按 Espressif 的安装说明安装并激活工具链。
-首次构建会由 IDF Component Manager 下载依赖；M5GFX 固定到实测 Git 提交，不依赖开发者本机目录。
+## Quick start
 
-1. 克隆仓库，在仓库根目录将 `config/example.json` 复制为 `config/local.json`。
-2. 编辑 `config/local.json`，填入自己的 Muse SDK token。
-3. 需要语音时，将 `minimax.enabled` 设为 `true` 并填入 API key；需要代理时填写节点参数并启用。
-4. 在激活 ESP-IDF 的终端中执行构建和刷写。
+Install Python 3, Git, and **ESP-IDF v6.0.1**, then activate the ESP-IDF environment.
+The first build downloads dependencies through IDF Component Manager. M5GFX is
+pinned to a tested Git revision; no developer-specific local dependency path is required.
 
-Windows PowerShell：
+1. Clone this repository and copy `config/example.json` to `config/local.json` at the repository root.
+2. Edit `config/local.json` and enter your own Muse SDK token.
+3. To enable speech, set `minimax.enabled` to `true` and provide your API key. To enable the proxy, enter your node settings and set `proxy.enabled` to `true`.
+4. Build and flash from a terminal with ESP-IDF activated.
+
+Windows PowerShell:
 
 ```powershell
 Copy-Item config/example.json config/local.json
-# 编辑 config/local.json，然后激活你的 ESP-IDF v6.0.1：
+# Edit config/local.json, then activate your ESP-IDF v6.0.1 environment:
 . C:/path/to/esp-idf/export.ps1
 python tools/build.py
 python tools/build.py --action flash --port COM5
 ```
 
-Linux/macOS：
+Linux/macOS:
 
 ```sh
 cp config/example.json config/local.json
-# 编辑私有配置后：
+# After editing your private configuration:
 . /path/to/esp-idf/export.sh
 python tools/build.py
 python tools/build.py --action flash --port /dev/ttyACM0
 ```
 
-通过 Muse App → 设置 → 设备 → 开启开发者模式 → 添加 MuseGadget 设备，
-配置 Wi-Fi，并在配对提示时按下 ATOMS3R 屏幕实体按钮。
-SDK token 从 [Muse Gadgets](https://gadgets.muse.ai/) 获取；服务账号、授权与费用由对应平台管理。
+In the Muse App, open Settings → Devices, enable Developer mode, and add your
+MuseGadget device. Configure Wi-Fi and press the ATOMS3R's physical screen button
+when prompted to confirm pairing.
+Get your SDK token from [Muse Gadgets](https://gadgets.muse.ai/).
+Accounts, permissions, and service charges are managed by the respective providers.
 
-## 配置
+## Configuration
 
-实际配置是 `config/local.json`；仓库仅提供不含凭据的 `config/example.json`。
+Your actual settings belong in `config/local.json`, which Git ignores.
+The repository provides `config/example.json` without credentials.
 
-| 配置项 | 含义 |
+| Setting | Purpose |
 |---|---|
-| `muse.sdk_token` | Muse Gadget SDK token；留空可以编译，但不能正常完成需要 token 的配对 |
-| `minimax.enabled` / `api_key` | 启用 MiniMax 流式朗读及个人 API key |
-| `minimax.url` | HTTPS 语音接口；示例为中国区，国际账户按服务接口修改 |
-| `minimax.model` / `voice` | 模型及默认音色；已保存的设备音色优先于默认值 |
-| `proxy.enabled` | 是否启用代理，默认关闭 |
-| `proxy.method` | 固定为 `2022-blake3-aes-128-gcm` |
-| `proxy.server` / `port` / `key` | IPv4 节点地址、TCP 端口、base64 编码的 16 字节 PSK |
+| `muse.sdk_token` | Your Muse Gadget SDK token. An empty token allows compilation, but pairing that requires a token will not work. |
+| `minimax.enabled` / `api_key` | Enable MiniMax streaming speech and supply your personal API key. |
+| `minimax.url` | The HTTPS speech endpoint. The example uses the China endpoint; international accounts should use their service endpoint. |
+| `minimax.model` / `voice` | Speech model and default voice. A voice already saved on the device takes precedence. |
+| `proxy.enabled` | Enable proxy routing; disabled by default. |
+| `proxy.method` | Must be `2022-blake3-aes-128-gcm`. |
+| `proxy.server` / `port` / `key` | Node IPv4 address, TCP port, and a base64-encoded 16-byte PSK. |
 
-当前代理只实现上述 SS2022 TCP 协议；不支持 VLESS/REALITY、订阅解析或 UDP。
-服务端须运行兼容节点并允许目标 HTTPS 连接；设备需要可用的 SNTP 校时。
+The proxy implements only the SS2022 TCP protocol listed above. It does not
+support VLESS/REALITY, subscription parsing, or UDP. Run a compatible server that
+allows the target HTTPS connections. The device also needs working SNTP time synchronization.
 
-`tools/build.py` 会校验 JSON 并生成被 Git 忽略的 `esp32/config/sdkconfig.local`。
-它也会更新已有构建目录的对应配置，避免 ESP-IDF 的旧 sdkconfig 覆盖新设置。
-修改 token、API key、节点和默认参数后重新构建、刷写即可，无需编辑 C/C++。
-这些参数属于编译配置，固件二进制会包含它们；不要公开个人构建产物。
-普通刷写不擦除 NVS 中的配对、Wi-Fi 和音色设置。
+`tools/build.py` validates the JSON and generates the ignored
+`esp32/config/sdkconfig.local`. It also updates the relevant settings in an
+existing build directory, preventing an old ESP-IDF sdkconfig from overriding
+new values. After changing credentials, node settings, or compiled defaults,
+rebuild and flash without editing C/C++.
+These are build-time settings: personal firmware binaries contain the configured
+credentials and should not be published. Normal flashing preserves pairing,
+Wi-Fi, and voice settings in NVS.
 
-首次构建会自动生成私有 `esp32/dev_signing_key.pem`，用于上游的 OTA 应用签名，
-该文件被 Git 忽略。保留它以便后续签名 OTA 更新使用同一个密钥；
-重新生成密钥后的固件可通过 USB 刷入，旧固件不会接受其他密钥签名的 OTA。
-本项目保留应用签名校验，不启用硬件 Secure Boot 或烧写 eFuse。
+The first build generates a private `esp32/dev_signing_key.pem` for OTA application
+signing. Git ignores this file. Keep it so later OTA updates can use the same
+signing key. Firmware signed with a new key can be installed over USB; an existing
+firmware will not accept OTA images signed with a different key.
+Application signature verification remains enabled. This project does not enable
+hardware Secure Boot or burn eFuses.
 
-音色在设备运行时修改：
+Change the voice at runtime:
 
 ```text
 >tts.voice=Chinese (Mandarin)_Cute_Spirit
@@ -87,33 +102,40 @@ SDK token 从 [Muse Gadgets](https://gadgets.muse.ai/) 获取；服务账号、�
 >tts.test
 ```
 
-在串口终端发送以上命令；默认波特率 115200。更多实现细节：
-[语音](esp32/components/muse/MINIMAX.md)、
-[代理](esp32/components/muse/PROXY.md)、
-[图片](esp32/components/muse/IMAGES.md)、
-[上游 ESP32 文档](esp32/README.md)。
-Muse App 仍可根据自身策略要求设备工具权限；base64 流程取消的是公网上传步骤。
+Send these commands through a serial terminal at 115200 baud. For implementation
+details, see [speech](esp32/components/muse/MINIMAX.md),
+[proxy routing](esp32/components/muse/PROXY.md),
+[images](esp32/components/muse/IMAGES.md), and the
+[upstream ESP32 documentation](esp32/README.md).
+Muse App may still request device-tool permissions under its own policy;
+the base64 route removes the public-upload step.
 
-## 验证与贡献
+## Validation and contributing
 
 ```sh
 python -m unittest discover -s tests
 python tools/check_secrets.py
-# 先构建一次以下载 cJSON 等依赖，再运行固件主机测试：
+# Build once to download cJSON and other dependencies, then run firmware host tests:
 python -m unittest discover -s esp32/tests
 ```
 
-完整主机测试需要 POSIX C/C++ 编译器、pkg-config、libmbedtls-dev、libpng-dev、
-libcjson-dev，以及 `pip install -r requirements-dev.txt`。
-真实密码学配对测试需要 `IDF_PATH`；未满足依赖时部分测试会跳过。
-CI 使用公开测试配置 `config/ci.json` 构建全部新增功能，并运行主机测试及密钥检查；
-其中地址属于文档保留网段，key 是公开测试向量，不能用于真实服务。
+The full host suite requires a POSIX C/C++ compiler, CMake, pkg-config,
+libmbedtls-dev, libpng-dev, libcjson-dev, and
+`pip install -r requirements-dev.txt`.
+The real-cryptography pairing test needs `IDF_PATH`; some tests are skipped when
+their dependencies are unavailable.
+CI builds all added features with the public `config/ci.json` fixture and runs
+host tests and credential checks. Its address is in a documentation-only range
+and its key is a public test vector, unsuitable for a real service.
 
-硬件验证记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
-贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，漏洞报告见 [SECURITY.md](SECURITY.md)。
+See [hardware validation](docs/VALIDATION.md),
+[contribution guidelines](CONTRIBUTING.md), and
+[security reporting](SECURITY.md). Some supporting documents are currently in Chinese.
 
-## 许可证
+## License
 
-[Apache-2.0](LICENSE)。上游归属和改动说明见 [NOTICE](NOTICE)，
-第三方依赖与授权见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-本仓库为独立社区项目，不代表 Muse、Meta、MiniMax 或 M5Stack 官方维护。
+[Apache-2.0](LICENSE). See [NOTICE](NOTICE) for upstream attribution and community
+changes, and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency and
+font licenses.
+This is an independent community project, not an official maintenance effort by
+Muse, Meta, MiniMax, or M5Stack.

@@ -2,6 +2,10 @@
 
 **English** | [简体中文](readme.CN.md)
 
+<p align="center">
+  <img src="assets/logo.webp" alt="ATOMS3R Muse Firmware logo" width="280" height="280">
+</p>
+
 Community firmware for **M5Stack ATOMS3R + Atomic Echo Base**, with Muse chat,
 MiniMax streaming speech, persistent voice selection, an optional Shadowsocks
 2022 TCP proxy, and private 128×128 image delivery. Licensed under Apache-2.0,

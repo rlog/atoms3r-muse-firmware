@@ -2,6 +2,10 @@
 
 [English](README.md) | **简体中文**
 
+<p align="center">
+  <img src="assets/logo.webp" alt="ATOMS3R Muse Firmware 项目 Logo" width="280" height="280">
+</p>
+
 面向 **M5Stack ATOMS3R + Atomic Echo Base** 的社区固件，支持 Muse 聊天、MiniMax 流式语音、可配置音色、可选 Shadowsocks 2022 TCP 代理和 128×128 图片私有直传。项目使用 Apache-2.0，第三方组件和字体保留各自许可证。
 
 基于 [Meta Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk)

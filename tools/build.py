@@ -7,6 +7,14 @@ import subprocess
 import sys
 from configure import ROOT, configure
 
+def ensure_signing_key(root=ROOT):
+    key=root/'esp32/dev_signing_key.pem'
+    if key.exists(): return 0
+    result=subprocess.run([sys.executable,'-m','espsecure','generate-signing-key',
+        '--version','2','--scheme','rsa3072','dev_signing_key.pem'],cwd=root/'esp32')
+    if result.returncode==0: key.chmod(0o600)
+    return result.returncode
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--config',type=Path,default=ROOT/'config/local.json')
@@ -21,6 +29,9 @@ def main():
         configure(args.config)
     except (OSError,ValueError) as error:
         ap.exit(2,'Configuration error: '+str(error)+'\n')
+    if args.action in ('build','flash'):
+        result=ensure_signing_key()
+        if result: return result
     cmd=[sys.executable,str(idf),'-B','build-muse-m5stack-atoms3r',
          '-DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON','-DIDF_TARGET=esp32s3',
          '-DSDKCONFIG=build-muse-m5stack-atoms3r/sdkconfig',

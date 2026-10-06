@@ -2,6 +2,9 @@ name: Build and test
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   firmware:
     runs-on: ubuntu-22.04

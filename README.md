@@ -74,6 +74,11 @@ SDK token 从 [Muse Gadgets](https://gadgets.muse.ai/) 获取；服务账号、�
 这些参数属于编译配置，固件二进制会包含它们；不要公开个人构建产物。
 普通刷写不擦除 NVS 中的配对、Wi-Fi 和音色设置。
 
+首次构建会自动生成私有 `esp32/dev_signing_key.pem`，用于上游的 OTA 应用签名，
+该文件被 Git 忽略。保留它以便后续签名 OTA 更新使用同一个密钥；
+重新生成密钥后的固件可通过 USB 刷入，旧固件不会接受其他密钥签名的 OTA。
+本项目保留应用签名校验，不启用硬件 Secure Boot 或烧写 eFuse。
+
 音色在设备运行时修改：
 
 ```text

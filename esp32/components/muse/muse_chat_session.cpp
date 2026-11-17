@@ -41,6 +41,10 @@
  * A typed turn (muse_hatch_text_turn, from the serial console) skips steps 1
  * and 3: the text goes to /chat/stream and the reply streams back to the
  * console as "@chat" lines instead of to the voice task.
+ *
+ * A realtime voice call (CONFIG_MUSE_REALTIME_VOICE, muse_voice_call.cpp)
+ * runs on the same connection and task, on streams of its own (K_CALL,
+ * K_END_CALL); this file only hands it their frames and polls it.
  */
 
 #include <atomic>
@@ -50,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <strings.h>
 
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
@@ -82,6 +87,13 @@ extern "C" {
 #include "muse_audio.h"
 }
 #include "muse_speech_segment.h"
+#include "sdkconfig.h"
+#if CONFIG_MUSE_REALTIME_VOICE
+#include "muse_voice_call_priv.h"
+#endif
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+#include "muse_review.h"
+#endif
 
 #include <xplat/noise/core/ClientSession.h>
 #include <xplat/noise/core/PsaCryptoBackend.h>
@@ -103,17 +115,29 @@ static uint32_t s_tts_job;
 #define NDJSON_LINE_MAX (16 * 1024)               /* one NDJSON line / the chat ack */
 #define SUB_LINE_MAX (256 * 1024)          /* an event line grows its buffer up to this */
 #define CHAT_PART (16 * 1024)              /* one body chunk of a long typed message */
+#if CONFIG_MUSE_HATCH_COMPACT_BUFFERS       /* 2 MB of PSRAM: see its Kconfig help */
+#define MP3_BUF (128 * 1024)
+#define IN_BYTES (MIC_RATE * 2 * 2)        /* 2 s of mic backlog while connecting */
+#define OUT_BYTES (MIC_RATE * 2 * 1)       /* 1 s of decoded reply */
+#else
 #define MP3_BUF (512 * 1024)
-#define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
-#define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
 #define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
-#define EV_TEXT 72
-#if CONFIG_MUSE_MINIMAX_TTS
-#define TEXT_MAX 8192                      /* bounded reply text, including Chinese UTF-8 */
-#else
-#define TEXT_MAX 1024
 #endif
+#define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
+#define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
+static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP3 buffer empty");
+#define EV_TEXT 72
+#define CAPTION_TEXT 1024                  /* a message's text, for captions timed to its speech */
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+#define TEXT_MAX (32 * 1024)               /* the whole reply, kept for later review, in PSRAM */
+#elif CONFIG_MUSE_MINIMAX_TTS
+#define TEXT_MAX 8192
+#else
+#define TEXT_MAX CAPTION_TEXT
+#endif
+/* The part of a message's kept text the automatic captions pace and show. */
+#define CAPTION_LEN(text) strnlen((text), CAPTION_TEXT - 1)
 #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
 #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
 #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
@@ -131,6 +155,9 @@ static uint32_t s_tts_job;
 #define TEXT_REPLY_TIMEOUT_US (5 * 60 * 1000000LL)   /* typed turns: agents can work a while */
 #define TEXT_TURN_CAP_US (15 * 60 * 1000000LL)
 #define TEXT_BUSY_HOLD_US (5 * 60 * 1000000LL)
+#define DETACH_US (20 * 1000000LL)         /* acked, Muse working, no reply yet: say so, and free the device */
+#define PENDING_US (30 * 60 * 1000000LL)   /* how long a detached request's reply is waited for */
+#define PENDING_IDLE_US (10 * 1000000LL)   /* ... once Muse no longer says it's working */
 /*
  * The VM's streaming dictation has no ASR behind it right now, so each press
  * goes to the chat as a voice note, the way the phone app sends them, and the
@@ -144,7 +171,7 @@ static uint32_t s_tts_job;
 
 /* ---- Voice task <-> session task ---- */
 
-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_PARAGRAPH_TEST };
+enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_INCOMING, CMD_PARAGRAPH_TEST };
 
 struct cmd_t {
     cmd_type_t type;
@@ -187,7 +214,7 @@ static int64_t s_auto_backoff_us = AUTO_RETRY_MIN_US;
 
 /* ---- Streams on the connection ---- */
 
-enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS };
+enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS, K_CALL, K_END_CALL };
 
 struct stream_t {
     int64_t id;
@@ -218,7 +245,8 @@ struct msg_t {
     bool done;
     tts_t tts;
     uint32_t pcm_start;      /* where its speech starts in the reply audio */
-    uint32_t pcm_frames;     /* how long it is; 0 until the MP3 has all arrived */
+    uint32_t pcm_frames;     /* estimated duration, refined as MP3 completes */
+    uint32_t pcm_end;        /* final queued cursor, including the caption hold */
 };
 
 struct resampler_t {
@@ -234,6 +262,9 @@ struct turn_t {
 #endif
     phase_t phase;
     uint32_t gen;
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+    uint32_t review;         /* this turn's identity for reply review (typed turns all have gen 0) */
+#endif
     bool text;               /* typed at the console: the reply goes there, unspoken */
     bool end_requested, end_sent, chat_posted, acked;
     int64_t dict_id, chat_id;
@@ -265,11 +296,34 @@ struct turn_t {
     resampler_t down;
     int kbps;
     int down_rate;
+    bool detached;           /* the reply is slow: a notice is said, the turn ends, the reply starts another */
+    bool incoming;           /* plays a reply to a request that outlived its turn */
+};
+
+/*
+ * A request Muse was still working on when its turn ended (turn_detach,
+ * pending_arm). Live deltas name no request, so its reply is known by the
+ * message row that names it (reply_to_message_id). That row is held until the
+ * voice task is idle and asks for it (muse_hatch_incoming), then played as a
+ * turn of its own (incoming_play). Forgotten once played, once Muse stops
+ * saying it's working (unless a row is held), or PENDING_US after it was armed.
+ */
+struct pending_t {
+    bool active;
+    bool busy;                   /* Muse's last word: still working */
+    int64_t armed_us, status_us; /* when it was armed, and Muse's last status */
+    char ids[2][80];             /* the request, as the ack named it */
+    char played[MAX_MSGS][80];   /* its messages already played */
+    int nplayed;
+    struct cJSON *replies;       /* its rows, held for the voice task (an array, at most MAX_MSGS) */
 };
 
 /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
  * there (the AIPI), so Wi-Fi setup and TLS have the internal RAM. */
 EXT_RAM_BSS_ATTR static turn_t s_turn;
+EXT_RAM_BSS_ATTR static pending_t s_pending;
+static std::atomic<bool> s_incoming{false};   /* a reply is held: muse_hatch_incoming() */
+static std::atomic<bool> s_incoming_used{false};   /* a voice task plays them (the Voice PE's doesn't) */
 
 /* Turn milestones, logged together when the turn ends. */
 enum mark_t : uint8_t { M_RELEASE, M_SENT, M_ACK, M_TEXT, M_DONE, M_TTS, M_MP3, M_AUDIO, M_COUNT };
@@ -283,6 +337,7 @@ static void log_marks(void);
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
 static int64_t s_last_seq;
+static int64_t s_last_row_seq;   /* message rows are numbered in the chat's own order, apart from live events */
 
 static int64_t now_us(void)
 {
@@ -539,13 +594,23 @@ static int ws_upgrade(esp_tls_t *tls, const char *vm_id, const char *token)
 {
     char id[3 * 128 + 1];
     query_escape(vm_id, id, sizeof(id));
-    size_t cap = 512 + strlen(id) + strlen(token) + strlen(s_host);
+    /* The VM takes the app identity of every request on this connection from
+     * the upgrade's app_id (it drops a per-request x-app-id), and voice calls
+     * need one. */
+    char app[3 * 64 + 16] = "";
+#if CONFIG_MUSE_REALTIME_VOICE
+    if (CONFIG_MUSE_REALTIME_VOICE_APP_ID[0]) {
+        strcpy(app, "&app_id=");
+        query_escape(CONFIG_MUSE_REALTIME_VOICE_APP_ID, app + 8, sizeof(app) - 8);
+    }
+#endif
+    size_t cap = 512 + strlen(id) + strlen(app) + strlen(token) + strlen(s_host);
     char *req = static_cast<char *>(malloc(cap));
     if (!req) {
         return 0;
     }
     int len = snprintf(req, cap,
-                       "GET " NOISE_PATH "?vm_id=%s HTTP/1.1\r\n"
+                       "GET " NOISE_PATH "?vm_id=%s%s HTTP/1.1\r\n"
                        "Host: %s\r\n"
                        "Authorization: Bearer %s\r\n"
                        "Upgrade: websocket\r\n"
@@ -553,7 +618,7 @@ static int ws_upgrade(esp_tls_t *tls, const char *vm_id, const char *token)
                        "Sec-WebSocket-Version: 13\r\n"
                        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                        "\r\n",
-                       id, s_host, token);
+                       id, app, s_host, token);
     bool sent = write_all(tls, req, len);
     free(req);
     if (!sent) {
@@ -767,6 +832,9 @@ static void disconnect(const char *why)
         s.kind = K_NONE;
     }
     s_connected = false;
+#if CONFIG_MUSE_REALTIME_VOICE
+    muse_voice_call_disconnected();
+#endif
 }
 
 static void forget_vm(void)
@@ -822,7 +890,7 @@ static bool resolve_vm(char *err, size_t err_cap)
 
 static bool open_subscription(void)
 {
-    s_last_seq = 0;
+    s_last_seq = s_last_row_seq = 0;
     s_conn.sub_id = open_stream(K_SUB, "POST", "/chat/subscribe", "application/json", "application/x-ndjson", "{}",
                                 true);
     return s_conn.sub_id != 0;
@@ -920,9 +988,9 @@ static bool ensure_connected(void)
         }
         int status;
         if (connect_once(err, sizeof(err), &status)) {
-            char detail[48] = "Connected to ";
-            strlcat(detail, s_vm.vm_name[0] ? s_vm.vm_name : s_vm.vm_id, sizeof(detail));
-            muse_hatch_report(MUSE_HATCH_REACHABLE, detail);
+            /* The settings page shows the VM in its VM ID row. */
+            muse_hatch_report_vm(s_vm.vm_id);
+            muse_hatch_report(MUSE_HATCH_REACHABLE, "");
             return true;
         }
         disconnect(err);
@@ -1010,7 +1078,7 @@ static void turn_done(bool complete)
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
     }
-    emit(MUSE_HATCH_EV_DONE, nullptr);
+    emit(MUSE_HATCH_EV_DONE, complete ? nullptr : "REPLY INCOMPLETE");
 #if CONFIG_MUSE_REPLY_IMAGES
     if(complete && s_turn.image_url[0]) {
         ESP_LOGI(TAG,"reply image queued");
@@ -1041,6 +1109,9 @@ static bool turn_start(uint32_t gen, bool text)
     s_turn.note = note;
     s_turn.texts = texts;
     s_turn.gen = gen;
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+    s_turn.review = muse_review_turn();
+#endif
     s_turn.text = text;
     s_turn.tts_msg = -1;
     memset(s_marks, 0, sizeof(s_marks));
@@ -1208,9 +1279,10 @@ static bool record_note(void)
 
 /*
  * Posts `text` to the chat and waits for the reply. A long message goes up in
- * parts, since each frame has to fit SCRATCH.
+ * parts, since each frame has to fit SCRATCH. A spoken turn names the device
+ * (MUSE_CHAT_SPOKEN_DEVICE); a typed one doesn't.
  */
-static void send_chat(const char *text, const char *modality)
+static void send_chat(const char *text, const char *modality, bool spoken)
 {
     s_turn.chat_posted = true;
     cJSON *body = cJSON_CreateObject();
@@ -1224,6 +1296,9 @@ static void send_chat(const char *text, const char *modality)
     cJSON_AddStringToObject(body, "message", request?request:text);
     free(request);
     cJSON_AddStringToObject(body, "output_modality", modality);
+    if (spoken) {
+        cJSON_AddStringToObject(body, "device", MUSE_CHAT_SPOKEN_DEVICE);
+    }
     char *json = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     size_t len = json ? strlen(json) : 0;
@@ -1263,7 +1338,7 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
-    send_chat(text, "text");
+    send_chat(text, "text", true);
 }
 
 /* A typed turn: the text goes straight to the chat. */
@@ -1273,7 +1348,7 @@ static void text_begin(const char *text)
         return;
     }
     ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
-    send_chat(text, "text");
+    send_chat(text, "text", false);
     if (s_turn.phase == P_WAIT_REPLY) {
         mark(M_SENT);
         muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
@@ -1342,6 +1417,22 @@ static bool is_user_id(const char *id)
     return id && id[0] && (!strcmp(id, s_turn.user_ids[0]) || !strcmp(id, s_turn.user_ids[1]));
 }
 
+static bool pending_played(const char *id)
+{
+    for (int i = 0; i < s_pending.nplayed; i++) {
+        if (!strcmp(id, s_pending.played[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *parent_id(cJSON *payload)
+{
+    const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "reply_to_message_id"));
+    return parent ? parent : cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
+}
+
 /* The message `id` if it belongs to this turn, binding it on first sight; else -1. */
 static int bind_msg(const char *id, cJSON *payload)
 {
@@ -1352,12 +1443,14 @@ static int bind_msg(const char *id, cJSON *payload)
     if (i >= 0 || s_turn.phase != P_WAIT_REPLY) {
         return i;
     }
-    const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "reply_to_message_id"));
-    if (!parent) {
-        parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
+    if (s_turn.incoming && pending_played(id)) {
+        return -1;   /* its row, after its turn played it */
     }
-    /* Once the ack names our message, replies to anything else are someone else's. */
-    if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0) {
+    const char *parent = parent_id(payload);
+    /* Once the ack names our message, replies to anything else are someone else's
+     * (a late turn's request includes the messages its earlier turns played). */
+    if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0 &&
+        !(s_turn.incoming && pending_played(parent))) {
         muse_chat_reject(&s_turn.rejected, id);
         return -1;
     }
@@ -1374,6 +1467,21 @@ static int bind_msg(const char *id, cJSON *payload)
     return s_turn.nmsgs++;
 }
 
+/* The first n bytes of s without a UTF-8 character cut short at their end. */
+static size_t whole_chars(const char *s, size_t n)
+{
+    size_t lead = n;
+    while (lead && n - lead < 3 && ((unsigned char)s[lead - 1] & 0xc0) == 0x80) {
+        lead--;
+    }
+    if (!lead) {
+        return n;
+    }
+    unsigned char c = (unsigned char)s[lead - 1];
+    size_t need = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+    return c >= 0xc0 && n - (lead - 1) < need ? lead - 1 : n;
+}
+
 static void append_text(msg_t &m, const char *text)
 {
     size_t add = strlen(text);
@@ -1382,14 +1490,14 @@ static void append_text(msg_t &m, const char *text)
         if (!m.len) {
             full[0] = '\0';
         }
-        strlcat(full, text, TEXT_MAX);
-        size_t n = strlen(full), start = n;
-        while (start && ((unsigned char)full[start - 1] & 0xc0) == 0x80) --start;
-        if (start) {
-            size_t lead = start - 1;
-            unsigned char c = full[lead];
-            size_t need = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
-            if (n - lead < need) full[lead] = '\0';
+        /* What fits, ending on a whole character (a cut one shows as a box).
+         * Once some is left out nothing more is added, or the rest of the
+         * reply would join on after the gap. */
+        size_t used = strlen(full);
+        if (used == m.len) {
+            size_t take = add < TEXT_MAX - 1 - used ? add : TEXT_MAX - 1 - used;
+            memcpy(full + used, text, take);
+            full[take < add ? whole_chars(full, used + take) : used + take] = '\0';
         }
     }
     m.len += add;
@@ -1434,6 +1542,16 @@ static void message_done(int i, const char *final_text)
     }
     m.done = true;
     mark(M_DONE);
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+    /* Keep complete final text, rather than the 1 KB automatic-caption copy.
+     * turn_detach()'s own "working on it" notice isn't an answer: keep the last one. */
+    const char *review = final_text && final_text[0] ? final_text
+        : m.len && s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
+    if (strcmp(m.id, "local-notice")) {
+        muse_review_store_complete(s_turn.review, review,
+            !(final_text && final_text[0]) && review && m.len > strlen(review));
+    }
+#endif
     if (s_turn.text) {
         /* The whole text if the pieces didn't add up to it (a line skipped, say): the reader uses it instead. */
         size_t n = m.len;
@@ -1454,6 +1572,15 @@ static void message_done(int i, const char *final_text)
     ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
 }
 
+/* A piece of message i's text, shown. */
+static void add_reply_text(int i, const char *text)
+{
+    msg_t &m = s_turn.msgs[i];
+    mark(M_TEXT);
+    append_text(m, text);
+    show_reply_start(m);   /* ignored once the speech starts */
+}
+
 static const char *msg_id(cJSON *payload, cJSON *event)
 {
     const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "message_id"));
@@ -1466,18 +1593,223 @@ static const char *msg_id(cJSON *payload, cJSON *event)
     return id && id[0] ? id : nullptr;
 }
 
+/* True for Muse's status events, updating *busy when they say. */
+static bool agent_status(const char *event, cJSON *payload, bool *busy)
+{
+    if (strcmp(event, "agent.status") && strcmp(event, "task.status")) {
+        return false;
+    }
+    const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "activity_code"));
+    const char *status = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "status"));
+    if (code) {
+        *busy = code[0] && strcmp(code, "online") && strcmp(code, "idle");
+    } else if (status) {
+        *busy = status[0] && strcmp(status, "completed") && strcmp(status, "failed");
+    }
+    return true;
+}
+
+static void pending_clear(void)
+{
+    s_pending.active = false;
+    cJSON_Delete(s_pending.replies);
+    s_pending.replies = nullptr;
+    s_incoming = false;
+}
+
+/* A row of the request already held (sent again, updated). */
+static bool pending_held(const char *id)
+{
+    cJSON *row;
+    cJSON_ArrayForEach(row, s_pending.replies) {
+        if (!strcmp(id, msg_id(row, nullptr) ?: "")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A finished message's text: its display text, else its content. */
+static const char *reply_text(cJSON *payload)
+{
+    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
+    return text ? text : cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+}
+
+/* With no turn running: Muse's status, and the reply of a request still waiting on it. */
+static void pending_event(const char *event, cJSON *payload, cJSON *line)
+{
+    if (!s_pending.active) {
+        return;
+    }
+    const char *parent = parent_id(payload);
+    /* The request, or one of its messages (a reply to a reply). */
+    bool ours = parent && parent[0] &&
+                (!strcmp(parent, s_pending.ids[0]) || !strcmp(parent, s_pending.ids[1]) || pending_played(parent) ||
+                 pending_held(parent));
+    bool status = !strcmp(event, "agent.status") || !strcmp(event, "task.status");
+    if (status && parent && parent[0] && !ours) {
+        return;   /* another request's status */
+    }
+    if (agent_status(event, payload, &s_pending.busy)) {
+        s_pending.status_us = now_us();
+        return;
+    }
+    if (strcmp(event, "message.assistant")) {
+        return;   /* only the finished row names the request */
+    }
+    const char *id = msg_id(payload, line);
+    const char *text = reply_text(payload);
+    /* An id too long for a turn's message couldn't be played as itself. */
+    if (!ours || !id || strlen(id) >= sizeof(msg_t::id) || pending_played(id) || pending_held(id) ||
+        cJSON_GetArraySize(s_pending.replies) >= MAX_MSGS ||
+        cJSON_IsFalse(cJSON_GetObjectItem(payload, "display_text_ready")) || !text || !text[0]) {
+        return;
+    }
+    if (!s_pending.replies) {
+        s_pending.replies = cJSON_CreateArray();
+    }
+    /* Only what playing it needs, and no more text than a turn keeps. */
+    size_t n = whole_chars(text, strnlen(text, TEXT_MAX - 1));
+    char *kept = static_cast<char *>(psram_alloc(n + 1));
+    if (kept) {
+        memcpy(kept, text, n);
+        kept[n] = '\0';
+    }
+    cJSON *row = cJSON_CreateObject();
+    if (!kept || !row || !cJSON_AddStringToObject(row, "message_id", id) ||
+        !cJSON_AddStringToObject(row, "reply_to_message_id", parent) ||
+        !cJSON_AddStringToObject(row, "display_text", kept)) {
+        cJSON_Delete(row);
+        row = nullptr;
+    }
+    free(kept);
+    if (row && cJSON_AddItemToArray(s_pending.replies, row)) {
+        ESP_LOGI(TAG, "the reply to a request that outlived its turn has come: holding it for the voice task");
+        s_incoming = true;
+    } else {
+        cJSON_Delete(row);
+    }
+}
+
+/*
+ * Remembers the request that just ended its turn, and what it played, to
+ * announce the rest. Again after one of its late turns: the same request,
+ * still timed from the first, and what played before stays played (the
+ * latest MAX_MSGS).
+ */
+static void pending_arm(void)
+{
+    bool same = s_turn.incoming && !memcmp(s_pending.ids, s_turn.user_ids, sizeof(s_pending.ids));
+    if (!same) {
+        memcpy(s_pending.ids, s_turn.user_ids, sizeof(s_pending.ids));
+        s_pending.nplayed = 0;
+        s_pending.armed_us = now_us();
+    }
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        if (pending_played(s_turn.msgs[i].id)) {
+            continue;
+        }
+        if (s_pending.nplayed == MAX_MSGS) {
+            memmove(s_pending.played[0], s_pending.played[1], sizeof(s_pending.played[0]) * (MAX_MSGS - 1));
+            s_pending.nplayed--;
+        }
+        strlcpy(s_pending.played[s_pending.nplayed++], s_turn.msgs[i].id, sizeof(s_pending.played[0]));
+    }
+    s_pending.active = s_pending.ids[0][0] || s_pending.ids[1][0];
+    s_pending.busy = s_turn.agent_busy;
+    s_pending.status_us = now_us();
+}
+
+/*
+ * Forgets the request once Muse has stopped working on it for a while, unless
+ * a row is held that the voice task hasn't taken yet (resting), and in any
+ * case PENDING_US after it was armed.
+ */
+static void pending_expire(int64_t t)
+{
+    bool idle = !s_pending.busy && !s_pending.replies && t - s_pending.status_us > PENDING_IDLE_US;
+    if (s_pending.active && (idle || t - s_pending.armed_us > PENDING_US)) {
+        ESP_LOGI(TAG, "no longer waiting for a late reply");
+        pending_clear();
+    }
+}
+
+/*
+ * The reply is slow (a long answer, a document): rather than wait on it, say
+ * so as a message of the turn, which ends once that's said, and remember the
+ * request. If the reply comes first, it follows the notice as usual.
+ */
+static void turn_detach(void)
+{
+    if (s_turn.nmsgs == MAX_MSGS) {
+        return;
+    }
+    ESP_LOGI(TAG, "no reply after %d s: telling the user, and waiting in the background", (int)(DETACH_US / 1000000));
+    char notice[128];
+    strlcpy(notice, "Muse is working on it. I'll tell you when it's done.", sizeof(notice));
+    int i = s_turn.nmsgs++;
+    s_turn.msgs[i] = msg_t{};
+    strlcpy(s_turn.msgs[i].id, "local-notice", sizeof(s_turn.msgs[i].id));
+    s_turn.detached = true;
+    s_turn.last_event_us = s_turn.last_content_us = now_us();
+    add_reply_text(i, notice);
+    message_done(i, nullptr);
+}
+
+static void on_message(const char *event, cJSON *payload, cJSON *line);
+
+/* The voice task is idle and ready for the held rows: a turn of their own, that nobody pressed for. */
+static void incoming_play(uint32_t gen)
+{
+    pending_expire(now_us());   /* held through a disconnect or a long rest: maybe too late now */
+    cJSON *replies = s_pending.replies;
+    s_pending.replies = nullptr;
+    s_incoming = false;   /* all of them play here */
+    if (!turn_start(gen, false)) {
+        cJSON_Delete(replies);   /* the reply stays in the app */
+        return;
+    }
+    memcpy(s_turn.user_ids, s_pending.ids, sizeof(s_turn.user_ids));
+    s_turn.phase = P_WAIT_REPLY;
+    s_turn.chat_posted = s_turn.acked = s_turn.incoming = true;
+    s_turn.agent_busy = s_pending.busy;
+    s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_pending.active = false;   /* delivered; the turn arms it again if Muse is still working */
+    /* Each row was matched to its request when held, which may be an earlier one
+     * than s_pending's now (a press came first): bind it under that request. */
+    cJSON *row;
+    cJSON_ArrayForEach(row, replies) {
+        const char *parent = parent_id(row);
+        strlcpy(s_turn.user_ids[1], parent ? parent : "", sizeof(s_turn.user_ids[1]));
+        on_message("message.assistant", row, nullptr);
+    }
+    memcpy(s_turn.user_ids, s_pending.ids, sizeof(s_turn.user_ids));
+    cJSON_Delete(replies);
+    if (!s_turn.nmsgs) {
+        turn_fail("");   /* forgotten meanwhile: end the voice task's wait quietly */
+    }
+}
+
 static void on_event(cJSON *line)
 {
     if (strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(line, "type")) ?: "", "event") != 0) {
         return;   /* the subscription ack */
     }
+    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, "event")) ?: "";
     cJSON *seq = cJSON_GetObjectItem(line, "seq");
     if (cJSON_IsNumber(seq)) {
+        int64_t &last = strcmp(event, "message.assistant") ? s_last_seq : s_last_row_seq;
         int64_t v = (int64_t)seq->valuedouble;
-        if (v > 0 && v <= s_last_seq) {
+        if (v > 0 && v <= last) {
             return;
         }
-        s_last_seq = v > s_last_seq ? v : s_last_seq;
+        last = v > last ? v : last;
+    }
+    cJSON *payload = cJSON_GetObjectItem(line, "payload");
+    if (s_turn.phase == P_IDLE) {
+        pending_event(event, payload, line);
+        return;
     }
     const char *approval_event=cJSON_GetStringValue(cJSON_GetObjectItem(line,"event"));
     if(approval_event && !strcmp(approval_event,"approvals.snapshot")) {
@@ -1489,8 +1821,6 @@ static void on_event(cJSON *line)
     if (s_turn.phase != P_WAIT_REPLY) {
         return;
     }
-    const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(line, "event")) ?: "";
-    cJSON *payload = cJSON_GetObjectItem(line, "payload");
 #if CONFIG_MUSE_REPLY_IMAGES
     if(muse_reply_image(payload,s_turn.image_url,sizeof(s_turn.image_url))) {
         ESP_LOGI(TAG,"image attachment received (%s)",event);
@@ -1498,21 +1828,22 @@ static void on_event(cJSON *line)
     }
 #endif
 
-    if (!strcmp(event, "agent.status") || !strcmp(event, "task.status")) {
-        const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "activity_code"));
-        const char *status = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "status"));
-        bool was = s_turn.agent_busy;
-        if (code) {
-            s_turn.agent_busy = code[0] && strcmp(code, "online") && strcmp(code, "idle");
-        } else if (status) {
-            s_turn.agent_busy = status[0] && strcmp(status, "completed") && strcmp(status, "failed");
-        }
+    bool was = s_turn.agent_busy;
+    if (agent_status(event, payload, &s_turn.agent_busy)) {
         if (s_turn.text && s_turn.agent_busy != was) {
             muse_hatch_console("busy", nullptr, "\"on\":%s", s_turn.agent_busy ? "true" : "false");
         }
-        s_turn.last_event_us = now_us();
+        if (!s_turn.detached) {   /* told and done: a stream of status mustn't keep it open */
+            s_turn.last_event_us = now_us();
+        }
         return;
     }
+    on_message(event, payload, line);
+}
+
+/* A message event of the turn's reply, from the subscription or held (incoming_play). */
+static void on_message(const char *event, cJSON *payload, cJSON *line)
+{
     bool start = !strcmp(event, "delta.message_start");
     bool append = !strcmp(event, "delta.text_append");
     bool done = !strcmp(event, "delta.message_done");
@@ -1521,6 +1852,10 @@ static void on_event(cJSON *line)
         return;
     }
     const char *id = msg_id(payload, line);
+    /* A late turn missed the start of anything that was already streaming: it takes that from its finished row. */
+    if (s_turn.incoming && (append || done) && id && find_msg(id) < 0) {
+        return;
+    }
     int i = id ? bind_msg(id, payload) : -1;
     if (i < 0) {
         return;
@@ -1544,18 +1879,17 @@ static void on_event(cJSON *line)
 #endif
         if (text && text[0] && s_turn.text) {
             mark(M_TEXT);
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+            append_text(m, text);
+#else
             m.len += strlen(text);
+#endif
             muse_hatch_console("text", text, "\"msg\":%d", i);
         } else if (text && text[0]) {
-            mark(M_TEXT);
-            append_text(m, text);
-            show_reply_start(m);   /* ignored once the speech starts */
+            add_reply_text(i, text);
         }
     } else if (done || full) {
-        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
-        if (!text) {
-            text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
-        }
+        const char *text = reply_text(payload);
         cJSON *ready = cJSON_GetObjectItem(payload, "display_text_ready");
         if (done || !cJSON_IsFalse(ready)) {
             message_done(i, text);
@@ -1593,9 +1927,9 @@ static void start_tts(void)
     for (int i = 0; i < s_turn.nmsgs; i++) {
         msg_t &m = s_turn.msgs[i];
         if (s_turn.text || m.tts == TTS_ACTIVE) continue;
-        char *full = s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
         size_t segment = 0;
 #if CONFIG_MUSE_MINIMAX_TTS
+        char *full = s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
         if (full && muse_settings_speaker_on()) {
             m.spoken_bytes += muse_speech_skip_space(full + m.spoken_bytes);
             segment = muse_speech_segment(full + m.spoken_bytes, m.done);
@@ -1607,9 +1941,11 @@ static void start_tts(void)
 #endif
         if (!segment && m.tts != TTS_QUEUED) continue;
         if (!m.speech_started) { m.pcm_start = s_turn.pcm_out; m.speech_started = true; }
-        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+        size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+        m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
+#if CONFIG_MUSE_MINIMAX_TTS
         s_tts_job = 0;
         if (s_turn.texts && muse_settings_speaker_on()) {
             char saved = full[m.spoken_bytes + segment];
@@ -1619,6 +1955,10 @@ static void start_tts(void)
             m.spoken_bytes += segment;
         }
         s_turn.silent = !s_tts_job;
+#else
+        s_turn.silent = true;
+#endif
+#if CONFIG_MUSE_MINIMAX_TTS
         if (s_tts_job) {
             m.pcm_frames = s_turn.pcm_out - m.pcm_start;
             s_turn.mp3_len = 0;
@@ -1628,7 +1968,9 @@ static void start_tts(void)
             mp3dec_init(&s_turn.dec);
             mark(M_TTS);
             ESP_LOGI(TAG, "streaming message %s: %u bytes, text_done=%d", m.id, (unsigned)segment, m.done);
-        } else {
+        } else
+#endif
+        {
             ESP_LOGI(TAG, "showing message %s (%u bytes)", m.id, (unsigned)m.len);
         }
         show_reply_start(m);
@@ -1695,6 +2037,7 @@ static void pace_silently(void)
         s_turn.pcm_out += n;
     }
     if (s_turn.pcm_out >= end) {
+        m.pcm_end = s_turn.pcm_out;
         /* A failed speech segment must not discard the rest of the message. */
         m.tts = m.spoken_bytes ? TTS_NONE : TTS_FINISHED;
         s_turn.tts_msg = -1;
@@ -1762,6 +2105,7 @@ static void decode(void)
         m.pcm_frames = s_turn.pcm_out - m.pcm_start + rest;
     }
     if (s_turn.mp3_ended && !s_turn.mp3_len) {
+        m.pcm_end = s_turn.pcm_out;
         m.pcm_frames = s_turn.pcm_out - m.pcm_start;
         m.tts = m.done && m.spoken_bytes >= strlen(s_turn.texts + s_turn.tts_msg * TEXT_MAX) ? TTS_FINISHED : TTS_NONE;
         s_turn.tts_msg = -1;
@@ -1780,9 +2124,22 @@ static void check_turn(void)
         return;
     }
     bool text = s_turn.text;
+    bool complete = s_turn.nmsgs > 0;
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        if (!s_turn.msgs[i].done || (!text && s_turn.msgs[i].len && s_turn.msgs[i].tts != TTS_FINISHED)) {
+            complete = false;
+            break;
+        }
+    }
     if (t - s_turn.start_us > (text ? TEXT_TURN_CAP_US : TURN_CAP_US)) {
         ESP_LOGW(TAG, "turn hit the time cap");
-        turn_done(false);
+        /* A voice turn that waited out the cap on a busy agent got no reply at all. */
+        if (!text && !s_turn.nmsgs) {
+            turn_fail("NO REPLY FROM MUSE");
+            return;
+        }
+        /* Finished only if every message is, and the agent isn't still working. */
+        turn_done(complete && !s_turn.agent_busy);
         return;
     }
     if (!s_turn.nmsgs) {
@@ -1792,26 +2149,34 @@ static void check_turn(void)
             return;
         }
 #endif
-        /* A typed turn waits as long as the agent says it's working. */
-        if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !(text && s_turn.agent_busy)) {
+        /* Muse says it's still on it: say so, and play its reply when it comes. */
+        if (!text && s_turn.acked && s_turn.agent_busy && s_incoming_used && t - s_turn.chat_us > DETACH_US) {
+            turn_detach();
+            return;
+        }
+        /* Wait as long as the agent says it's working; the turn cap still applies. */
+        if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !s_turn.agent_busy) {
             turn_fail("NO REPLY FROM MUSE");
         }
         return;
     }
-    for (int i = 0; i < s_turn.nmsgs; i++) {
-        if (!s_turn.msgs[i].done || (!text && s_turn.msgs[i].len && s_turn.msgs[i].tts != TTS_FINISHED)) {
-            return;
-        }
+    if (!complete) {
+        return;
     }
     if (t - s_turn.last_event_us < SETTLE_US) {
         return;
     }
-    if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
+    if (s_turn.agent_busy && !s_turn.detached && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
         return;
     }
     ESP_LOGI(TAG, "turn done: %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);
     log_marks();
+    /* Still working (or told so): its next message comes in the background. */
+    bool more = !text && s_incoming_used && (s_turn.detached || s_turn.agent_busy);
     turn_done(true);
+    if (more) {
+        pending_arm();
+    }
 }
 
 /* ---- Inbound dispatch ---- */
@@ -1878,6 +2243,12 @@ static void stream_data(stream_t *s, ConstByteSpan data)
             tts_data(data.data(), data.size());
         }
         break;
+#if CONFIG_MUSE_REALTIME_VOICE
+    case K_CALL:
+    case K_END_CALL:
+        muse_voice_call_data(s->id, data.data(), data.size());
+        break;
+#endif
     default:
         break;
     }
@@ -1907,6 +2278,16 @@ static bool stream_end(stream_t *s, bool ok)
     case K_TTS:
         tts_end(s, ok);
         break;
+#if CONFIG_MUSE_REALTIME_VOICE
+    case K_CALL:
+    case K_END_CALL: {
+        int64_t id = s->id;
+        int status = s->status;
+        close_stream(s);
+        muse_voice_call_stream_end(id, ok, status);
+        break;
+    }
+#endif
     default:
         break;
     }
@@ -1935,6 +2316,20 @@ static bool on_frame(const DecodedServiceFrame &f)
         if (f.response.status >= 400) {
             return on_http_error(s, f.response);
         }
+#if CONFIG_MUSE_REALTIME_VOICE
+        if (s->kind == K_CALL) {
+            const char *date = nullptr;
+            size_t date_len = 0;
+            for (size_t i = 0; i < f.response.headers.size(); i++) {
+                const HeaderView &h = f.response.headers[i];
+                if (h.key.size() == 4 && !strncasecmp(h.key.data(), "date", 4)) {
+                    date = h.value.data();
+                    date_len = h.value.size();
+                }
+            }
+            muse_voice_call_head(s->id, f.response.status, date, date_len);
+        }
+#endif
         stream_data(s, f.response.body);
         if (f.response.end_body && alive(s, f.stream_id)) {
             return stream_end(s, true);
@@ -1965,6 +2360,11 @@ static bool poll_socket(void)
         if (s_turn.tts_msg >= 0 && MP3_BUF - s_turn.mp3_len < MP3_POLL_ROOM) {
             return true;
         }
+#if CONFIG_MUSE_REALTIME_VOICE
+        if (muse_voice_call_rx_full()) {
+            return true;   /* the voice task is behind on the call's audio */
+        }
+#endif
         ssize_t n = ws_recv(s_conn.tls, s_conn.rx, SCRATCH, false);
         if (n == -2) {
             return true;
@@ -2008,6 +2408,16 @@ static void drop_connection(const char *why)
     muse_hatch_report(MUSE_HATCH_UNTESTED, "");
 }
 
+/* A realtime call is starting, running or ending. */
+static bool call_busy(void)
+{
+#if CONFIG_MUSE_REALTIME_VOICE
+    return muse_voice_call_busy();
+#else
+    return false;
+#endif
+}
+
 static void handle(const cmd_t &cmd)
 {
     switch (cmd.type) {
@@ -2023,7 +2433,7 @@ static void handle(const cmd_t &cmd)
         }
         break;
     case CMD_CONNECT:
-        if (s_turn.phase == P_IDLE) {
+        if (s_turn.phase == P_IDLE && !call_busy()) {
             disconnect("reconnect requested");
             ensure_connected();
         }
@@ -2033,6 +2443,7 @@ static void handle(const cmd_t &cmd)
             turn_fail("SETTINGS CHANGED");
         }
         disconnect("settings changed");
+        pending_clear();
         forget_vm();
         s_auto_next_us = 0;
         s_auto_backoff_us = AUTO_RETRY_MIN_US;
@@ -2068,6 +2479,20 @@ static void handle(const cmd_t &cmd)
         break;
     case CMD_WAKE:   /* only ends hatch_task's resting wait */
         break;
+    case CMD_INCOMING:
+        if (cmd.gen != s_gen.load()) {
+            break;   /* a press came first: the rows stay held, offered again once idle */
+        }
+        if (s_turn.phase != P_IDLE) {
+            /* A typed turn has the session: end the voice task's wait, and offer them after it. */
+            ev_t ev = {};
+            ev.type = MUSE_HATCH_EV_ERROR;
+            ev.gen = cmd.gen;
+            xQueueSend(s_events, &ev, pdMS_TO_TICKS(200));
+            break;
+        }
+        incoming_play(cmd.gen);
+        break;
     }
 }
 
@@ -2078,8 +2503,12 @@ static void hatch_task(void *arg)
         cmd_t cmd;
         /* Resting, the socket's keepalive (PING_US) needs no quicker polls.
          * Resting unconnected, Wi-Fi may nap (muse_wifi_nap): wait for a
-         * turn or for waking (CMD_WAKE) instead of watching it. */
-        int wait_ms = !s_connected ? (s_resting ? -1 : 200) : s_turn.phase != P_IDLE ? 2 : s_resting ? 500 : 20;
+         * turn or for waking (CMD_WAKE) instead of watching it. A call
+         * wakes it too. */
+        int wait_ms = call_busy() ? 2
+                      : !s_connected ? (s_resting ? -1 : 200)
+                      : s_turn.phase != P_IDLE ? 2
+                      : s_resting ? 500 : 20;
         TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
         if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
             handle(cmd);
@@ -2087,6 +2516,13 @@ static void hatch_task(void *arg)
                 handle(cmd);
             }
         }
+#if CONFIG_MUSE_REALTIME_VOICE
+        if (!muse_voice_call_poll()) {
+            drop_connection("call send failed");
+            continue;
+        }
+#endif
+        pending_expire(now_us());   /* connected or not */
         if (!s_connected) {
             if (!muse_wifi_connected()) {
                 s_auto_next_us = 0;
@@ -2130,11 +2566,14 @@ static void hatch_task(void *arg)
             continue;
         }
         check_turn();
+        if (s_turn.phase == P_IDLE && s_pending.replies) {
+            s_incoming = true;   /* held rows not played yet (a press or a typed turn came first) */
+        }
 
         int64_t t = now_us();
         if (t - s_conn.last_rx_us > DEAD_US) {
             drop_connection("server went quiet");
-        } else if (s_turn.phase == P_IDLE && t - s_conn.last_use_us > IDLE_CLOSE_US) {
+        } else if (s_turn.phase == P_IDLE && !call_busy() && !s_pending.active && t - s_conn.last_use_us > IDLE_CLOSE_US) {
             disconnect("idle");
             muse_hatch_report(MUSE_HATCH_UNTESTED, "");
             s_auto_next_us = INT64_MAX;   /* the next turn connects */
@@ -2183,12 +2622,23 @@ extern "C" void muse_hatch_start(void)
     if (!s_events) {
         s_events = xQueueCreate(16, sizeof(ev_t));
     }
-    s_in = xStreamBufferCreateWithCaps(IN_BYTES, 1, MALLOC_CAP_SPIRAM);
+    /* A byte over: a stream buffer made with caps keeps one back (FreeRTOS's
+     * static buffers do), and with an odd room left, a send that fills it stops
+     * halfway through a sample. */
+    s_in = xStreamBufferCreateWithCaps(IN_BYTES + 1, 1, MALLOC_CAP_SPIRAM);
     s_out = xStreamBufferCreateWithCaps(OUT_BYTES, 1, MALLOC_CAP_SPIRAM);
     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
     s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
+#if CONFIG_MUSE_LATEST_REPLY
+    s_turn.texts = static_cast<char *>(heap_caps_malloc(MAX_MSGS * TEXT_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_turn.texts) {
+        ESP_LOGW(TAG, "latest reply receiver allocation failed");
+        muse_review_unavailable();
+    }
+#else
     s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
+#endif
     s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
     s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
     for (auto &s : s_streams) {
@@ -2196,6 +2646,9 @@ extern "C" void muse_hatch_start(void)
         s.cap = NDJSON_LINE_MAX;
     }
     s_turn.tts_msg = -1;
+#if CONFIG_MUSE_REALTIME_VOICE
+    muse_voice_call_init();   /* calls stay unavailable if it fails; notes still work */
+#endif
     /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
     if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
         xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
@@ -2243,7 +2696,8 @@ extern "C" void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)
     }
 }
 
-/* Both ends move whole frames, so the buffer never splits one. */
+/* Both ends move whole frames, and the buffer holds a whole number of them (see
+ * its creation), so a send that fills it never splits one. */
 extern "C" size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms)
 {
     return xStreamBufferSend(s_in, pcm, frames * sizeof(int16_t), pdMS_TO_TICKS(wait_ms)) / sizeof(int16_t);
@@ -2269,6 +2723,49 @@ extern "C" void muse_hatch_set_resting(bool resting)
     }
 }
 
+#if CONFIG_MUSE_REALTIME_VOICE
+/* ---- For the realtime call (muse_voice_call_priv.h), on this task ---- */
+
+/* The call sizes its reply-buffer headroom by the largest frame body. */
+static_assert(SCRATCH <= MUSE_SESSION_FRAME_MAX, "inbound frames outgrew the call's reply headroom");
+
+extern "C" int64_t muse_session_call_open(bool media, const char *path, const char *content_type, const char *body,
+                                          bool end_body)
+{
+    if (!s_connected) {
+        return 0;
+    }
+    return open_stream(media ? K_CALL : K_END_CALL, "POST", path, content_type,
+                       media ? "application/x-ndjson" : "application/json", body, end_body);
+}
+
+extern "C" bool muse_session_call_send(int64_t id, const uint8_t *data, size_t len, bool end_body)
+{
+    if (!s_connected) {
+        return false;
+    }
+    if (!find_stream(id)) {
+        return true;   /* the stream already ended: nothing to send it */
+    }
+    return send_body(id, data, len, end_body);
+}
+
+extern "C" void muse_session_call_reset(int64_t id)
+{
+    send_reset(id);
+}
+
+extern "C" bool muse_session_call_connect(void)
+{
+    return ensure_connected();
+}
+
+extern "C" void muse_session_call_wake(void)
+{
+    post(CMD_WAKE, 0);
+}
+#endif
+
 extern "C" void muse_hatch_text_turn(char *text)
 {
     cmd_t cmd{ CMD_TEXT, 0, text };
@@ -2286,6 +2783,19 @@ extern "C" void muse_hatch_text_cancel(void)
     post(CMD_TEXT_CANCEL, 0);
 }
 
+extern "C" bool muse_hatch_incoming(void)
+{
+    s_incoming_used = true;
+    if (!s_incoming.exchange(false)) {
+        return false;
+    }
+    /* A turn of its own, numbered here like a press's, so a press that follows replaces it. */
+    uint32_t gen = ++s_gen;
+    drain_out();
+    post(CMD_INCOMING, gen);
+    return true;
+}
+
 extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
 {
     ev_t ev;
@@ -2298,18 +2808,44 @@ extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
     return MUSE_HATCH_EV_NONE;
 }
 
+/* Both caption paging and the rim follow the message at the playback cursor. */
+static int reply_message_at(size_t played)
+{
+    int message = -1;
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        const msg_t &m = s_turn.msgs[i];
+        if (m.tts >= TTS_ACTIVE && m.len && m.pcm_start <= played) message = i;
+    }
+    return message;
+}
+
+static uint32_t reply_frames(const msg_t &m, size_t caption_len)
+{
+    return m.pcm_frames ? m.pcm_frames : (uint32_t)((uint64_t)caption_len * MIC_RATE / SPEECH_CHARS_PER_S);
+}
+
+extern "C" float muse_turn_progress(size_t played, int *message)
+{
+    int i = reply_message_at(played);
+    if (message) *message = i;
+    if (i < 0) return 0;
+    const msg_t &m = s_turn.msgs[i];
+    size_t len = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+    uint32_t frames = reply_frames(m, len);
+    if (!frames) return 0;
+    size_t elapsed = played - m.pcm_start;
+    bool complete = m.tts == TTS_FINISHED && m.pcm_end && played >= m.pcm_end;
+    if (complete) return 1;
+    float fraction = (float)elapsed / frames;
+    return fraction < 0.99f ? fraction : 0.99f;
+}
+
 extern "C" bool muse_hatch_turn_caption(size_t played, char *out, size_t cap)
 {
-    /* The message being spoken: the last one whose speech has started. */
-    const msg_t *m = nullptr;
-    const char *text = nullptr;
-    for (int i = 0; i < s_turn.nmsgs && s_turn.texts; i++) {
-        const msg_t &c = s_turn.msgs[i];
-        if (c.tts >= TTS_ACTIVE && c.len && c.pcm_start <= played) {
-            m = &c;
-            text = s_turn.texts + i * TEXT_MAX;
-        }
-    }
+    if (!s_turn.texts) return false;
+    int i = reply_message_at(played);
+    const msg_t *m = i >= 0 ? &s_turn.msgs[i] : nullptr;
+    const char *text = i >= 0 ? s_turn.texts + i * TEXT_MAX : nullptr;
     if (!m) {
         /* Nothing said yet: the reply's opening page, to read while the speech is on its way. */
         for (int i = 0; i < s_turn.nmsgs && s_turn.texts; i++) {
@@ -2319,8 +2855,8 @@ extern "C" bool muse_hatch_turn_caption(size_t played, char *out, size_t cap)
         }
         return false;
     }
-    size_t len = strlen(text);
-    uint32_t frames = m->pcm_frames ? m->pcm_frames : (uint32_t)(len * MIC_RATE / SPEECH_CHARS_PER_S);
+    size_t len = CAPTION_LEN(text);
+    uint32_t frames = reply_frames(*m, len);
     size_t at = frames ? (size_t)((uint64_t)(played - m->pcm_start) * len / frames) : 0;
     if (at >= len) {
         at = len ? len - 1 : 0;

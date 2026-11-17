@@ -21,7 +21,6 @@
 #define IMAGE_URL_CAP 2048
 #define IMAGE_BYTES_MAX (4*1024*1024)
 static const char *TAG = "link.image";
-static atomic_bool image_busy;
 static atomic_uint image_generation;
 typedef struct {
     char url[IMAGE_URL_CAP], location[IMAGE_URL_CAP];
@@ -194,7 +193,7 @@ static bool image_commit(reply_image_t *f) {
     int x0=(f->sw-f->dw)/2;
     for(int y=0;y<f->dh;++y) memcpy(screen+(y+y0)*f->sw+x0,f->frame+y*f->dw,f->dw*2);
     bool ok=image_current(f) && led_status_draw_rect(0,0,f->sw,f->sh,screen);
-    if(ok) led_status_draw_done();
+    if(ok) { image_fetch_note_draw(); led_status_draw_done(); }
     free(screen); return ok;
 }
 static void image_task(void *arg) {
@@ -236,7 +235,7 @@ static void image_task(void *arg) {
     ESP_LOGI(TAG,"image %s: %s %dx%d, %u bytes in %d ms",result.ok?"displayed":"failed",
         result.ok?result.format:result.message,result.width,result.height,(unsigned)result.bytes,result.ms);
     if(f->done) f->done(&result,f->user);
-    free(f->base64); free(f->inline_data); free(f->frame); free(f); atomic_store(&image_busy,false);
+    free(f->base64); free(f->inline_data); free(f->frame); free(f); image_fetch_release();
     vTaskDeleteWithCaps(NULL);
 }
 bool image_fetch_base64_start(const char *data,image_fetch_done_cb done,void *user,
@@ -247,8 +246,7 @@ bool image_fetch_base64_start(const char *data,image_fetch_done_cb done,void *us
         *code="invalid_params"; *message="base64 must contain 1..49152 characters, padded to a multiple of four"; return false;
     }
     if(!led_status_display_info(&w,&h)) { *code="unsupported"; *message="no display"; return false; }
-    bool expected=false;
-    if(!atomic_compare_exchange_strong(&image_busy,&expected,true)) {
+    if(!image_fetch_claim()) {
         *code="busy"; *message="another image is being displayed"; return false;
     }
     reply_image_t *f=image_alloc(sizeof(*f));
@@ -262,7 +260,7 @@ bool image_fetch_base64_start(const char *data,image_fetch_done_cb done,void *us
         }
         free(f->base64); free(f);
     }
-    atomic_store(&image_busy,false); *code="out_of_memory"; *message="inline image allocation failed"; return false;
+    image_fetch_release(); *code="out_of_memory"; *message="inline image allocation failed"; return false;
 }
 bool image_fetch_start(const char *url,int row,image_fetch_done_cb done,void *user,
                        const char **code,const char **message) {
@@ -271,8 +269,7 @@ bool image_fetch_start(const char *url,int row,image_fetch_done_cb done,void *us
     if(!url||strncasecmp(url,"https://",8)||strlen(url)>=IMAGE_URL_CAP||row< -1||row>=h) {
         *code="invalid_params"; *message="an HTTPS image URL and valid row are required"; return false;
     }
-    bool expected=false;
-    if(!atomic_compare_exchange_strong(&image_busy,&expected,true)) {
+    if(!image_fetch_claim()) {
         *code="busy"; *message="another image is downloading"; return false;
     }
     reply_image_t *f=image_alloc(sizeof(*f));
@@ -284,5 +281,5 @@ bool image_fetch_start(const char *url,int row,image_fetch_done_cb done,void *us
             MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)==pdPASS) return true;
         free(f);
     }
-    atomic_store(&image_busy,false); *code="out_of_memory"; *message="image task allocation failed"; return false;
+    image_fetch_release(); *code="out_of_memory"; *message="image task allocation failed"; return false;
 }

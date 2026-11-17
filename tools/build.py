@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build or flash ATOMS3R after activating ESP-IDF v6.0.1."""
+"""Build or flash ATOMS3R after activating ESP-IDF v6.0.3."""
 import argparse
 import os
 from pathlib import Path
@@ -22,7 +22,7 @@ def main():
     ap.add_argument('--port',help='Serial port for flash or monitor (e.g. COM5 or /dev/ttyACM0)')
     args=ap.parse_args()
     idf=Path(os.environ.get('IDF_PATH',''))/'tools/idf.py'
-    if not idf.is_file(): ap.error('Activate ESP-IDF v6.0.1 first (IDF_PATH is missing).')
+    if not idf.is_file(): ap.error('Activate ESP-IDF v6.0.3 first (IDF_PATH is missing).')
     if args.action in ('flash','monitor') and not args.port:
         ap.error('--port is required for flash or monitor')
     try:

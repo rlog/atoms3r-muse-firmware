@@ -34,6 +34,12 @@ class SecretCheck(unittest.TestCase):
             file=root/'esp32/tests/link_pairing_handshake_harness.c'; file.parent.mkdir(parents=True)
             file.write_text('mgst_'+'A'*43)
             self.git(root,'add','.'); self.assertEqual(self.scan(root)[0],0)
+            identity=root/'esp32/tests/link_identity_harness.c'
+            identity.write_text('mgst_'+'B'*42+'A')
+            self.git(root,'add','.'); self.assertEqual(self.scan(root)[0],0)
+            identity.write_text('mgst_'+'B'*43)
+            self.git(root,'add','.'); self.assertEqual(self.scan(root)[0],1)
+            identity.write_text('mgst_'+'B'*42+'A')
             (root/'firmware.bin').write_bytes(b'not-for-publication')
             self.git(root,'add','.'); self.assertEqual(self.scan(root)[0],1)
 

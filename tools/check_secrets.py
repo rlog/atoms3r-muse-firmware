@@ -44,6 +44,9 @@ def main():
         matches=[m.group() for p in PATTERNS for m in p.finditer(data)]
         if name=='esp32/tests/link_pairing_handshake_harness.c':
             matches=[m for m in matches if m!=fixture]
+        # Exact public identity-test vector from the pinned upstream SDK.
+        if name=='esp32/tests/link_identity_harness.c':
+            matches=[m for m in matches if m!=b'mgst_'+b'B'*42+b'A']
         if forbidden or matches or any(s in data for s in known):
             failures.append(name)
     if failures:

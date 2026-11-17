@@ -184,7 +184,12 @@ extern "C" uint32_t muse_minimax_start(const char *text)
     if (!s_jobs) {
         s_jobs = xQueueCreate(1, sizeof(job_t));
         s_audio = xQueueCreateWithCaps(24, sizeof(muse_minimax_packet_t), MALLOC_CAP_SPIRAM);
-        if (!s_jobs || !s_audio || xTaskCreate(worker, "minimax_tts", 12288, nullptr, 4, nullptr) != pdPASS) {
+        // TLS needs a 12 KiB stack, larger than the internal heap's remaining
+        // contiguous blocks once Link and the UI are connected on ATOMS3R.
+        if (!s_jobs || !s_audio ||
+            xTaskCreateWithCaps(worker, "minimax_tts", 12288, nullptr, 4, nullptr,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            ESP_LOGE(TAG, "MiniMax worker allocation failed");
             if (s_jobs) vQueueDelete(s_jobs);
             if (s_audio) vQueueDeleteWithCaps(s_audio);
             s_jobs = s_audio = nullptr;

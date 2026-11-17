@@ -16,16 +16,50 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
-// Both buffers must be at least 32 bytes. XXXXXX = last 3 WiFi STA MAC octets.
-// node_id "homelink-XXXXXX" (lower) is the backend device identifier (used by
-// device-token mint/refresh); ble_name "MuseGadget-XXXXXX" (upper) is the
-// advertised BLE name.
+#define IDENTITY_SDK_TOKEN_LEN 48
+
+// XXXXXX = last 3 WiFi STA MAC octets. The node id (lower hex) is the backend
+// device identifier (device-token mint/refresh, link.register, chat turns);
+// ble_name "MuseGadget-XXXXXX" (upper) is the advertised BLE name.
+//
+// Node ids: a new setup offers "gadget-XXXXXX" with
+// CONFIG_MUSE_GADGET_NODE_ID_PREFIX (off by default), else "homelink-XXXXXX"
+// (identity_setup_node_id()), and stores it with the device tokens (NVS
+// "node_id"). The stored id is the one
+// in use (identity_node_id()) until the device is set up again. A device set
+// up by earlier firmware, which stored no id, keeps "homelink-XXXXXX", the id
+// its tokens were issued for; one not set up uses the setup id.
 void identity_init(void);
 const char *identity_node_id(void);
+const char *identity_setup_node_id(void);
+// Reads the stored id again (identity_init() does it at boot): call once
+// setup has stored new credentials or they were erased. Returns true when
+// the id in use changed.
+bool identity_refresh_node_id(void);
 const char *identity_ble_name(void);
 const char *identity_mac(void);
 const char *identity_device_id(void);
-// The maker's SDK token (CONFIG_GADGET_SDK_TOKEN), or NULL when the build has none.
+// The maker's SDK token: the one stored in NVS, else the build's
+// (CONFIG_GADGET_SDK_TOKEN), else NULL. Call after identity_init().
 const char *identity_sdk_token(void);
+// Whether token looks like an SDK token, the way the build checks one.
+bool identity_sdk_token_valid(const char *token);
+// Stores a valid token in NVS; it's used from the next boot. False if token
+// isn't valid or can't be stored.
+bool identity_set_sdk_token(const char *token);
+
+// The part of an SDK token gadgets.muse.ai shows: "mgst_" and 7 more.
+#define IDENTITY_SDK_TOKEN_HINT_LEN 12
+// Muse records a gadget's SDK token only when it pairs, so a token set later
+// takes effect only after pairing again. Call when the gadget stores
+// credentials from pairing or a mint, to remember the token they were issued
+// for. config_clear_pairing() forgets it.
+void identity_note_paired_sdk_token(void);
+// True when the gadget is paired with another SDK token (or with none) than
+// identity_sdk_token(), and needs pairing again to use it. paired_hint gets
+// that token's hint, or "none". False when no token was noted, as for a
+// gadget paired by older firmware.
+bool identity_sdk_token_changed_since_pairing(char *paired_hint, size_t cap);

@@ -22,9 +22,14 @@ def settings(document):
     sections = {'muse':{'sdk_token'}, 'minimax':{'enabled','api_key','url','model','voice'},
                 'proxy':{'enabled','method','server','port','key'}}
     for section, keys in sections.items():
-        if not isinstance(document[section], dict) or set(document[section]) != keys:
+        actual = set(document[section]) if isinstance(document[section], dict) else set()
+        if section == 'muse': actual.discard('realtime_voice')
+        if not isinstance(document[section], dict) or actual != keys:
             raise ValueError(section + ' has missing or unknown configuration keys')
     muse, speech, proxy = (document[k] for k in sections)
+    realtime = muse.get('realtime_voice', False)
+    if type(realtime) is not bool:
+        raise ValueError('muse.realtime_voice must be true or false')
     for section in (speech,proxy):
         if type(section['enabled']) is not bool:
             raise ValueError('enabled must be true or false')
@@ -56,6 +61,9 @@ def settings(document):
         if len(decoded)!=16 or base64.b64encode(decoded).decode()!=key:
             raise ValueError('proxy.key must be canonical base64 for a 16-byte PSK')
     return {'GADGET_SDK_TOKEN':token,
+            'MUSE_REALTIME_VOICE':realtime,
+            'MUSE_DEVICE_MODEL_ID':'muse-gadget-m5stack-atoms3r',
+            'MUSE_DEVICE_MODEL_NAME':'M5Stack AtomS3R + Atomic Echo Base',
             'MUSE_MINIMAX_TTS':speech['enabled'], 'MUSE_MINIMAX_API_KEY':api_key if speech['enabled'] else '',
             'MUSE_MINIMAX_URL':url, 'MUSE_MINIMAX_MODEL':model, 'MUSE_MINIMAX_VOICE':voice,
             'MUSE_SS2022_PROXY':proxy['enabled'], 'MUSE_SS2022_SERVER':server if proxy['enabled'] else '',
@@ -78,9 +86,12 @@ def merge(existing,values):
         match=re.match(r'(?:# )?CONFIG_([A-Z0-9_]+)(?:=| is not set)',line)
         if not match or match[1] not in values:
             kept.append(line)
-    return '\n'.join(kept)+'\n'+render(values)
+    return '\n'.join(kept).rstrip()+'\n'+render(values)
 
 def private_write(path,text):
+    # Keep unchanged defaults from triggering another IDF component resolution.
+    if path.is_file() and path.read_text(encoding="utf-8") == text:
+        return
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(text,encoding='utf-8',newline='\n')
     path.chmod(0o600)

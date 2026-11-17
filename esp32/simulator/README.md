@@ -18,7 +18,10 @@ limitations under the License.
 
 This is a desktop preview of the Muse interface in a 412 x 412 SenseCAP
 Watcher window. It compiles the production `muse_ui.c`, state and text code,
-and the avatar renderer. SDL supplies the display, mouse input, and timing while
+and the avatar renderer. Like the firmware, it uses
+`components/muse/avatar/muse_pixel.c` when present and the bundled default
+otherwise. Adding or removing the custom file takes effect on the next build.
+SDL supplies the display, mouse input, and timing while
 small host adapters stand in for ESP-IDF, FreeRTOS, Wi-Fi, Bluetooth, Link,
 settings, and power services.
 
@@ -185,7 +188,7 @@ Supported scenario keys are:
 - `ble`: `off`, `advertising`, or `connected`; plus `passkey` and `paired`
 - `link`: `boot`, `unpaired`, `pairing`, `confirm`, `connecting`, `online`,
   `offline`, or `error`
-- `speaker`, `brightness`, and `advance` in milliseconds
+- `speaker`, `call` (preview the live-call layout), `brightness`, and `advance` in milliseconds
 
 Invalid options and scenario values return a nonzero exit status and identify
 the bad line.

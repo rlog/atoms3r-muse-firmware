@@ -1,6 +1,7 @@
 {
   "muse": {
-    "sdk_token": ""
+    "sdk_token": "",
+    "realtime_voice": false
   },
   "minimax": {
     "enabled": false,
